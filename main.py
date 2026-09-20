@@ -8,6 +8,10 @@ detector = PoseDetector()
 # Open webcam
 camera = cv2.VideoCapture(0)
 
+# Create resizable window
+WINDOW_NAME = "AI Gym - Body Joint Detection"
+cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+
 
 # Important body landmarks
 BODY_POINTS = {
@@ -140,7 +144,7 @@ while True:
 
     # Show camera
     cv2.imshow(
-        "AI Gym - Body Joint Detection",
+        WINDOW_NAME,
         frame
     )
 

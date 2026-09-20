@@ -1,3 +1,4 @@
+import os
 import cv2
 import mediapipe as mp
 
@@ -7,10 +8,11 @@ from mediapipe.tasks.python import vision
 
 class PoseDetector:
 
-    def __init__(self):
+    def __init__(self, model_path=None):
 
         # Path to the AI pose model
-        model_path = "pose_landmarker.task"
+        if model_path is None:
+            model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pose_landmarker.task")
 
         # Configure the model
         base_options = python.BaseOptions(
