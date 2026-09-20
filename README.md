@@ -15,7 +15,7 @@
 
 ## 📌 Project Overview
 
-The **AI Posture Corrector** is an intelligent, vision-based virtual trainer and workout assistant designed to facilitate safe, guided home workouts. By leveraging computer vision and real-time human pose estimation, the software monitors user movements, tracks key anatomical landmarks, and guides fitness enthusiasts to execute exercises with proper form and posture without needing expensive wearable sensors.
+The **AI Powered Posture Corrector for Gym and Home Exercises** is an intelligent, vision-based virtual trainer and workout assistant designed to facilitate safe, guided home workouts. By leveraging computer vision and real-time human pose estimation, the software monitors user movements, tracks key anatomical landmarks, and guides fitness enthusiasts to execute exercises with proper form and posture without needing expensive wearable sensors.
 
 ---
 
