@@ -19,38 +19,20 @@ The **AI Powered Posture Corrector for Gym and Home Exercises** is an intelligen
 
 ---
 
-## 📊 Project Status (Review 2 — ~20% Milestone)
+## 📊 Project Features & Capabilities
 
-This project is currently under active development. For the **Review 2** submission, the foundational computer vision and pose tracking pipeline has been implemented:
-
-### ✅ What Has Been Built So Far:
-- **Live Video & Camera Feed Processing**: Real-time webcam capture with OpenCV.
-- **MediaPipe Pose Landmarker Integration**: Integration with MediaPipe Tasks Vision API (`pose_landmarker.task`) for high-performance landmark extraction.
-- **Joint & Landmark Tracking**: Real-time tracking and mapping of crucial body joints:
-  - Face
-  - Upper Body: Shoulders, Elbows, Wrists
-  - Lower Body: Hips, Knees, Ankles
-- **Skeleton & Joint Overlay**: Dynamic rendering of connection lines (skeletal structure) and key joint nodes over the video stream.
-- **Person Presence Detection**: Visual state indicators (`PERSON DETECTED` / `NO PERSON DETECTED`).
-- **Responsive Display**: Resizable OpenCV rendering window supporting various screen resolutions.
-
----
-
-## 🚀 Future Roadmap & Upcoming Features
-
-The following features and enhancements are scheduled for subsequent development phases:
-
-- 🎯 **Enhanced Accuracy & Angle Analysis**: High-precision geometric and mathematical angle calculations for joint alignment.
-- 🧠 **Custom ML Model Training**: Training custom classification models to analyze specific exercise trajectories and exercise states.
-- 📋 **Workout Routine Selection (Split Days)**: Modular workout categories such as **Leg Day**, **Chest Day**, **Back & Arms**, and **Core Workouts**.
-- 🔍 **Auto-Detection of Exercises**: Automatic classification of exercises (e.g., Squats, Push-ups, Bicep Curls, Lunges) without requiring manual mode switching.
-- ⚠️ **Real-Time Form & Posture Feedback**:
-  - Clear visual and textual alerts for correct vs. incorrect postures.
-  - Pinpointing specific body parts with incorrect placement (e.g., *“Keep your back straight”*, *“Knees overshooting toes”*, *“Elbows flaring”*).
-- 🔢 **Automated Rep Counter & Tracker**:
-  - Live repetition counting based on repetition phase analysis (eccentric / concentric phases).
-  - Tracking completed sets, pending exercises, and workout duration.
-- 👤 **Personalized Training & Recommendations**: User-adaptive workout plans with difficulty adjustments and performance analytics.
+### ✅ Core Features Implemented:
+- **3D Camera-Invariant Angle Analysis**: Calculates real Euclidean 3D joint angles using MediaPipe `pose_world_landmarks`, making flexion and extension tracking completely immune to camera distance, tilt, and perspective distortion.
+- **Viewpoint & Orientation Auto-Detection**: Real-time detection of user orientation (`FRONTAL`, `SIDE_LEFT`, `SIDE_RIGHT`, `OBLIQUE`) with dynamic HUD cues.
+- **Biomechanical Posture Checks**:
+  - **Bicep Curls**: 3D upper-arm torso pinning (prevents cheating with front deltoids), 3D lateral elbow flaring, and peak contraction over-curling alerts.
+  - **Squats**: 3D femur parallel angle, true spinal/torso inclination from vertical (prevents excessive forward lean), and knee valgus (knee cave) checks in frontal view.
+  - **Tricep Overhead Extensions**: True 3D overhead vertical alignment, elbow tendon hyperflexion protection (<58°), and full overhead lockout detection.
+- **Automated Repetition Counter & Tracker**: Biomechanically accurate state machines with phase tracking (`READY`, `CONCENTRIC`, `PEAK`, `ECCENTRIC`) that differentiates between clean reps and reps with posture alerts.
+- **Temporal EMA Smoothing & Feedback Debouncing**:
+  - Exponential Moving Average (EMA) removes landmark flutter and micro-jitter without latency.
+  - Hysteresis feedback debouncer eliminates rapid visual flickering and guarantees readable messages.
+- **High-Definition Stream & Modern Glassmorphic HUD**: Stream capture at 960x540 for high landmark resolution with semi-transparent HUD cards, live FPS, rep counts, and target guides.
 
 ---
 
@@ -58,7 +40,8 @@ The following features and enhancements are scheduled for subsequent development
 
 - **Programming Language**: Python 3.10+ / 3.13
 - **Computer Vision**: OpenCV (`opencv-python`)
-- **Pose Estimation**: Google MediaPipe (`mediapipe`)
+- **Pose Estimation**: Google MediaPipe Tasks Vision (`mediapipe`)
+- **Scientific Computing**: NumPy (`numpy`)
 
 ---
 
@@ -77,13 +60,14 @@ pip install -r requirements.txt
 ```
 
 ### 3. Run the Application
-Start the pose detection pipeline:
+Start the interactive virtual trainer:
 ```bash
 python main.py
 ```
 
 ### 4. Controls
-- **Resize Window**: Drag window borders or maximize the screen.
+- **Select Exercise**: Press `1` (Bicep Curls), `2` (Squats), or `3` (Tricep Extensions).
+- **Return to Menu**: Press **`m`** while in an exercise.
 - **Exit Application**: Press **`q`** on your keyboard while the window is focused.
 
 ---
@@ -94,8 +78,10 @@ python main.py
 AI-Posture-Corrector/
 │
 ├── pose_landmarker.task   # MediaPipe pretrained pose landmarker model
-├── pose_detector.py       # Pose detection & landmark extraction module
-├── main.py                # Main webcam feed, skeleton rendering & UI loop
+├── pose_detector.py       # Pose detection & high-precision timestamping module
+├── biomechanics.py        # 3D vector math, viewpoint auto-detection, EMA & rep counting
+├── main.py                # Main webcam feed, exercise state machines & modern HUD
 ├── requirements.txt       # Project dependencies
 └── README.md              # Project documentation
 ```
+

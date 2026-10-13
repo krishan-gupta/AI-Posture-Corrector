@@ -1,28 +1,48 @@
+"""
+AI Gym - Real-Time Posture Corrector & Virtual Trainer
+Enhanced with:
+- 3D Camera-Invariant Angle and Biomechanical Analysis
+- Real-Time Viewpoint Auto-Detection (Frontal / Side / Oblique)
+- Temporal EMA Smoothing for Flutter-Free Landmark Tracking
+- Hysteresis Feedback Debouncer
+- Automatic Repetition Counter & Form Quality Tracker
+- High-Definition Stream Processing with Modern HUD
+"""
 
-import cv2
+import os
+import time
 import math
+import cv2
 import numpy as np
+
 from pose_detector import PoseDetector
+import biomechanics as bio
+import tricep_trainer
 
-# =========================
-# SETTINGS
-# =========================
+# ==============================================================================
+# SETTINGS & CONSTANTS
+# ==============================================================================
 
-WINDOW_NAME = "AI Gym - Posture Corrector"
+
+WINDOW_NAME = "AI Gym - Posture Corrector & Virtual Trainer"
 CAMERA_INDEX = 0
 
-FRAME_WIDTH = 640
-FRAME_HEIGHT = 360
+# High-resolution standard stream for precise full-body joint tracking
+FRAME_WIDTH = 960
+FRAME_HEIGHT = 540
 
-GREEN = (0, 200, 0)
-RED = (0, 0, 255)
-YELLOW = (0, 255, 255)
-WHITE = (255, 255, 255)
-BLUE = (255, 160, 50)
-BLACK = (25, 25, 25)
-DARK_GRAY = (45, 45, 45)
+# Color Palette (BGR)
+GREEN = (40, 210, 40)
+RED = (40, 40, 245)
+YELLOW = (0, 215, 255)
+WHITE = (245, 245, 245)
+CYAN = (235, 205, 50)
+BLUE = (255, 140, 0)
+BLACK = (20, 20, 20)
+DARK_GRAY = (35, 35, 35)
+ACCENT_PURPLE = (180, 80, 220)
 
-# MediaPipe pose landmark indices
+# MediaPipe landmark indices
 LEFT_SHOULDER, RIGHT_SHOULDER = 11, 12
 LEFT_ELBOW, RIGHT_ELBOW = 13, 14
 LEFT_WRIST, RIGHT_WRIST = 15, 16
@@ -41,115 +61,65 @@ LEGS = [
 ]
 
 
-# =========================
-# HELPER FUNCTIONS
-# =========================
+# ==============================================================================
+# DRAWING & HUD UTILITIES
+# ==============================================================================
 
-def point(landmarks, index, width, height):
-    lm = landmarks[index]
+def point_2d(landmarks_2d, index, width, height):
+    """Convert normalized 2D landmark to pixel coordinate."""
+    lm = landmarks_2d[index]
     return int(lm.x * width), int(lm.y * height)
 
 
-def calculate_angle(a, b, c):
-    ba = (a[0] - b[0], a[1] - b[1])
-    bc = (c[0] - b[0], c[1] - b[1])
+def draw_card(frame, x, y, w, h, bg_color=DARK_GRAY, alpha=0.75, border_color=None):
+    """Draw a modern semi-transparent card on the frame."""
+    x = max(0, min(frame.shape[1] - 1, x))
+    y = max(0, min(frame.shape[0] - 1, y))
+    w = max(1, min(frame.shape[1] - x, w))
+    h = max(1, min(frame.shape[0] - y, h))
 
-    denominator = math.hypot(*ba) * math.hypot(*bc)
-
-    if denominator == 0:
-        return 0
-
-    cosine = (ba[0] * bc[0] + ba[1] * bc[1]) / denominator
-    cosine = max(-1, min(1, cosine))
-
-    return math.degrees(math.acos(cosine))
-
-
-def visible(landmark):
-    value = getattr(landmark, "visibility", 0)
-    return value is not None and value >= 0.5
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x, y), (x + w, y + h), bg_color, -1)
+    cv2.addWeighted(overlay, alpha, frame, 1.0 - alpha, 0, frame)
+    if border_color:
+        cv2.rectangle(frame, (x, y), (x + w, y + h), border_color, 1)
 
 
 def draw_dotted_line(frame, start, end, color=YELLOW):
-    """Draw a dotted line between two points."""
+    """Draw a clean dotted guide line between two pixel points."""
     x1, y1 = start
     x2, y2 = end
-
-    distance = math.hypot(x2 - x1, y2 - y1)
-
-    if distance < 1:
+    dist = math.hypot(x2 - x1, y2 - y1)
+    if dist < 2:
         return
 
-    dx = (x2 - x1) / distance
-    dy = (y2 - y1) / distance
+    dx = (x2 - x1) / dist
+    dy = (y2 - y1) / dist
+    dash_len = 6
+    gap_len = 6
+    step = dash_len + gap_len
 
-    dash_length = 5
-    gap_length = 7
-    step = dash_length + gap_length
-
-    for position in range(0, int(distance), step):
-        finish = min(position + dash_length, distance)
-
-        p1 = (
-            int(x1 + dx * position),
-            int(y1 + dy * position)
-        )
-
-        p2 = (
-            int(x1 + dx * finish),
-            int(y1 + dy * finish)
-        )
-
-        cv2.line(frame, p1, p2, color, 2)
+    for p in range(0, int(dist), step):
+        p_end = min(p + dash_len, dist)
+        pt1 = (int(x1 + dx * p), int(y1 + dy * p))
+        pt2 = (int(x1 + dx * p_end), int(y1 + dy * p_end))
+        cv2.line(frame, pt1, pt2, color, 2)
 
 
 def draw_arm_guide(frame, shoulder, elbow, wrist, side):
-    """
-    Draw a target guide for each arm in bicep curls.
-    The curled wrist target is mirrored between arms.
-    """
+    """Draw target alignment guide lines for bicep curls."""
     height, width = frame.shape[:2]
-
-    upper_length = math.hypot(
-        elbow[0] - shoulder[0],
-        elbow[1] - shoulder[1]
-    )
-
-    lower_length = math.hypot(
-        wrist[0] - elbow[0],
-        wrist[1] - elbow[1]
-    )
-
-    if upper_length < 5 or lower_length < 5:
+    upper_len = math.hypot(elbow[0] - shoulder[0], elbow[1] - shoulder[1])
+    lower_len = math.hypot(wrist[0] - elbow[0], wrist[1] - elbow[1])
+    if upper_len < 10 or lower_len < 10:
         return
 
-    # Approximate upper-arm target below the shoulder.
-    target_elbow = (
-        shoulder[0],
-        min(height - 1, int(shoulder[1] + upper_length))
-    )
-
-    # Approximate lowered-arm wrist target.
-    extended_wrist = (
-        target_elbow[0],
-        min(height - 1, int(target_elbow[1] + lower_length))
-    )
-
-    # Mirror the curl target for the two screen-side arms.
+    target_elbow = (shoulder[0], min(height - 1, int(shoulder[1] + upper_len)))
+    extended_wrist = (target_elbow[0], min(height - 1, int(target_elbow[1] + lower_len)))
     direction = -1 if side == "LEFT" else 1
-
     curled_wrist = (
-        max(
-            0,
-            min(
-                width - 1,
-                int(target_elbow[0] + direction * lower_length * 0.7)
-            )
-        ),
-        max(
-            0,
-            int(target_elbow[1] - lower_length * 0.7)
-        )
+        max(0, min(width - 1, int(target_elbow[0] + direction * lower_len * 0.72))),
+        max(0, int(target_elbow[1] - lower_len * 0.70))
     )
 
     draw_dotted_line(frame, shoulder, target_elbow)
@@ -157,713 +127,512 @@ def draw_arm_guide(frame, shoulder, elbow, wrist, side):
     draw_dotted_line(frame, target_elbow, curled_wrist)
 
 
-def draw_tricep_guide(frame, shoulder, elbow, wrist, side):
-    """
-    Draw target guide for overhead tricep extensions.
-    Guide lines represent stationary vertical upper arm and full extension path.
-    """
-    height, width = frame.shape[:2]
-
-    upper_length = math.hypot(
-        elbow[0] - shoulder[0],
-        elbow[1] - shoulder[1]
-    )
-    lower_length = math.hypot(
-        wrist[0] - elbow[0],
-        wrist[1] - elbow[1]
-    )
-
-    if upper_length < 5 or lower_length < 5:
-        return
-
-    # Stationary vertical upper arm target pointing overhead
-    target_elbow = (
-        shoulder[0],
-        max(0, int(shoulder[1] - upper_length))
-    )
-
-    # Full overhead extension target (straight up)
-    target_extended_wrist = (
-        target_elbow[0],
-        max(0, int(target_elbow[1] - lower_length))
-    )
-
-    # Flexed target behind head (elbow bent at ~90 degrees)
-    direction = 1 if side == "LEFT" else -1
-    target_flexed_wrist = (
-        max(0, min(width - 1, int(target_elbow[0] + direction * lower_length * 0.5))),
-        min(height - 1, int(target_elbow[1] + lower_length * 0.7))
-    )
-
-    draw_dotted_line(frame, shoulder, target_elbow)
-    draw_dotted_line(frame, target_elbow, target_extended_wrist)
-    draw_dotted_line(frame, target_elbow, target_flexed_wrist)
 
 
 def draw_squat_guide(frame, hip, knee, ankle, side):
-    """
-    Draw target guide for squats showing ideal parallel thigh level at knee height.
-    """
+    """Draw target squat depth parallel guide."""
     height, width = frame.shape[:2]
-
     thigh_len = math.hypot(knee[0] - hip[0], knee[1] - hip[1])
-    shin_len = math.hypot(ankle[0] - knee[0], ankle[1] - knee[1])
-
-    if thigh_len < 5 or shin_len < 5:
+    if thigh_len < 10:
         return
 
     direction = -1 if side == "LEFT" else 1
-
-    # Ideal parallel squat hip target: horizontally aligned with knee
     target_hip = (
         max(0, min(width - 1, int(knee[0] + direction * thigh_len * 0.85))),
         int(knee[1])
     )
-
     draw_dotted_line(frame, ankle, knee)
     draw_dotted_line(frame, knee, target_hip)
 
 
-def draw_arm(frame, shoulder, elbow, wrist, color):
-    cv2.line(frame, shoulder, elbow, color, 4)
-    cv2.line(frame, elbow, wrist, color, 4)
-
-    for p in (shoulder, elbow, wrist):
-        cv2.circle(frame, p, 5, color, -1)
+def draw_bone(frame, pt1, pt2, color, thickness=4):
+    cv2.line(frame, pt1, pt2, color, thickness)
+    cv2.circle(frame, pt1, 5, color, -1)
+    cv2.circle(frame, pt2, 5, color, -1)
 
 
-def draw_leg(frame, hip, knee, ankle, color):
-    cv2.line(frame, hip, knee, color, 4)
-    cv2.line(frame, knee, ankle, color, 4)
-
-    for p in (hip, knee, ankle):
-        cv2.circle(frame, p, 5, color, -1)
-
-
-def draw_torso(frame, shoulder, hip, color):
-    cv2.line(frame, shoulder, hip, color, 3)
-    cv2.circle(frame, shoulder, 5, color, -1)
-    cv2.circle(frame, hip, 5, color, -1)
-
-
-def draw_top_bar(frame, title):
+def draw_header_hud(frame, title, viewpoint, rep_stats, fps):
+    """Render top status dashboard with exercise info, viewpoint, reps, and FPS."""
     height, width = frame.shape[:2]
-    cv2.rectangle(frame, (0, 0), (width, 42), BLACK, -1)
+    draw_card(frame, 0, 0, width, 50, bg_color=BLACK, alpha=0.88)
 
-    cv2.putText(
-        frame, title,
-        (12, 28), cv2.FONT_HERSHEY_SIMPLEX,
-        0.65, BLUE, 2
-    )
+    # Title
+    cv2.putText(frame, title, (16, 32), cv2.FONT_HERSHEY_DUPLEX, 0.75, CYAN, 2)
 
-    cv2.putText(
-        frame, "M: MENU | Q: QUIT",
-        (width - 180, 28),
-        cv2.FONT_HERSHEY_SIMPLEX, 0.48, WHITE, 1
-    )
+    # Viewpoint badge
+    view_color = GREEN if "SIDE" in viewpoint else (YELLOW if "OBLIQUE" in viewpoint else WHITE)
+    view_str = f"VIEW: {viewpoint.replace('_', ' ')}"
+    cv2.putText(frame, view_str, (290, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.55, view_color, 2)
+
+    # Rep Counter
+    reps_str = f"REPS: {rep_stats['total_reps']} (CLEAN: {rep_stats['good_reps']})"
+    cv2.putText(frame, reps_str, (520, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.58, GREEN, 2)
+
+    # FPS & Controls
+    cv2.putText(frame, f"{int(fps)} FPS | M: MENU | Q: QUIT", (width - 240, 32),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, WHITE, 1)
 
 
-def draw_feedback_banner(frame, message, color):
+def draw_bottom_hud(frame, feedback_text, feedback_color, stage_text=""):
+    """Render bottom feedback card and repetition stage."""
     height, width = frame.shape[:2]
-    banner_y = height - 52
-    cv2.rectangle(frame, (8, banner_y - 20), (width - 8, banner_y + 10), DARK_GRAY, -1)
-    cv2.putText(
-        frame, f"FEEDBACK: {message}",
-        (16, banner_y), cv2.FONT_HERSHEY_SIMPLEX,
-        0.52, color, 2
-    )
+    card_h = 62
+    card_y = height - card_h - 10
 
+    draw_card(frame, 12, card_y, width - 24, card_h, bg_color=DARK_GRAY, alpha=0.90, border_color=(70, 70, 70))
 
-def draw_legend(frame):
-    height, width = frame.shape[:2]
-    y = height - 12
-    cv2.putText(frame, "RED: Adjust", (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.42, RED, 1)
-    cv2.putText(frame, "GREEN: Good", (135, y), cv2.FONT_HERSHEY_SIMPLEX, 0.42, GREEN, 1)
-    cv2.putText(frame, "YELLOW DOTS: Guide", (260, y), cv2.FONT_HERSHEY_SIMPLEX, 0.42, YELLOW, 1)
+    # Stage Badge if present
+    x_offset = 24
+    if stage_text:
+        stage_w = 110
+        cv2.rectangle(frame, (20, card_y + 12), (20 + stage_w, card_y + card_h - 12), (55, 55, 55), -1)
+        cv2.putText(frame, stage_text, (28, card_y + 38), cv2.FONT_HERSHEY_SIMPLEX, 0.55, CYAN, 2)
+        x_offset = 145
+
+    # Feedback Message
+    cv2.putText(frame, f"FEEDBACK: {feedback_text}", (x_offset, card_y + 38),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.58, feedback_color, 2)
 
 
 def get_camera(index=CAMERA_INDEX):
-    camera = cv2.VideoCapture(index, cv2.CAP_DSHOW)
-    if not camera.isOpened():
-        camera = cv2.VideoCapture(index)
+    """Open camera with optimal driver and resolution."""
+    cam = cv2.VideoCapture(index, cv2.CAP_DSHOW)
+    if not cam.isOpened():
+        cam = cv2.VideoCapture(index)
 
-    camera.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
-    camera.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
-    camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    return camera
+    cam.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
+    cam.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+    cam.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    return cam
 
 
-# =========================
-# EXERCISE MENU
-# =========================
+# ==============================================================================
+# MENU SCREEN
+# ==============================================================================
 
 def draw_menu():
-    frame = np.zeros((540, 800, 3), dtype=np.uint8)
-    frame[:] = (30, 30, 30)
+    """Display interactive exercise selection menu."""
+    frame = np.zeros((540, 840, 3), dtype=np.uint8)
+    frame[:] = (26, 26, 28)
 
-    cv2.putText(
-        frame, "AI GYM - POSTURE CORRECTOR",
-        (65, 70), cv2.FONT_HERSHEY_SIMPLEX,
-        1, WHITE, 2
-    )
-
-    cv2.putText(
-        frame, "Choose an exercise",
-        (65, 125), cv2.FONT_HERSHEY_SIMPLEX,
-        0.7, BLUE, 2
-    )
+    # Header Card
+    draw_card(frame, 40, 30, 760, 95, bg_color=(40, 40, 44), alpha=0.95, border_color=(60, 60, 65))
+    cv2.putText(frame, "AI GYM - VIRTUAL TRAINER & POSTURE CORRECTOR", (60, 70),
+                cv2.FONT_HERSHEY_DUPLEX, 0.78, WHITE, 2)
+    cv2.putText(frame, "Powered by 3D Biomechanical Pose Estimation (MediaPipe Tasks)", (60, 105),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.48, CYAN, 1)
 
     items = [
-        ("1. Bicep Curls", GREEN),
-        ("2. Squats", GREEN),
-        ("3. Tricep Extensions", GREEN),
-        ("4. Push-ups - Coming Soon", WHITE),
+        ("1. Bicep Curls", "Upper Arm Pinning, 3D Peak Contraction, Full Extension, Flare Check", GREEN),
+        ("2. Squats", "3D Parallel Depth, Knee Valgus (Cave) Check, Torso Inclination", GREEN),
+        ("3. Tricep Extensions", "3D Overhead Vertical Alignment, Tendon Protection, Lockout", GREEN),
+        ("4. Push-ups", "Coming Soon in Next Module", (150, 150, 150)),
     ]
 
-    y = 200
+    y = 155
+    for title, desc, color in items:
+        draw_card(frame, 40, y, 760, 64, bg_color=(36, 36, 40), alpha=0.90, border_color=(60, 60, 65))
+        cv2.putText(frame, title, (65, y + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.70, color, 2)
+        cv2.putText(frame, desc, (65, y + 52), cv2.FONT_HERSHEY_SIMPLEX, 0.43, WHITE, 1)
+        y += 76
 
-    for label, color in items:
-        cv2.rectangle(
-            frame, (65, y - 32), (735, y + 18),
-            (55, 55, 55), -1
-        )
-
-        cv2.putText(
-            frame, label, (90, y),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.75, color, 2
-        )
-
-        y += 75
-
-    cv2.putText(
-        frame, "Press Q to quit",
-        (65, 500), cv2.FONT_HERSHEY_SIMPLEX,
-        0.6, WHITE, 1
-    )
+    cv2.putText(frame, "Press 1, 2, or 3 to select exercise  |  Press Q to quit", (40, 500),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.52, (180, 180, 180), 1)
 
     cv2.imshow(WINDOW_NAME, frame)
 
 
-# =========================
-# 1. BICEP CURLS
-# =========================
+# ==============================================================================
+# 1. BICEP CURLS (3D Camera-Invariant Engine)
+# ==============================================================================
 
 def run_bicep_curls():
     detector = PoseDetector()
     camera = get_camera(CAMERA_INDEX)
-
     if not camera.isOpened():
-        print("Cannot open webcam. Check CAMERA_INDEX.")
-        detector.detector.close()
+        print("Cannot open webcam.")
+        detector.close()
         return "menu"
 
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(WINDOW_NAME, 960, 600)
+    cv2.resizeWindow(WINDOW_NAME, 1080, 640)
+
+    smoother = bio.EMASmoother(alpha=0.35)
+    debouncer = bio.FeedbackDebouncer(required_frames=4, min_hold_seconds=1.2)
+    rep_counter = bio.RepetitionCounter("BICEP_CURLS")
+
+    prev_time = time.time()
 
     try:
         while True:
             success, frame = camera.read()
-
             if not success:
                 continue
 
-            frame = cv2.flip(frame, 1)
-            frame = cv2.resize(
-                frame,
-                (FRAME_WIDTH, FRAME_HEIGHT),
-                interpolation=cv2.INTER_AREA
-            )
+            now = time.time()
+            fps = 1.0 / max(1e-4, now - prev_time)
+            prev_time = now
 
+            frame = cv2.flip(frame, 1)
+            frame = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT), interpolation=cv2.INTER_AREA)
             height, width = frame.shape[:2]
+
             results = detector.detect_pose(frame)
 
+            detected_issue = None
             feedback_msg = "Keep upper arms still at your sides"
             feedback_color = WHITE
+            viewpoint = "FRONTAL"
 
-            if results.pose_landmarks:
-                landmarks = results.pose_landmarks[0]
-                arm_results = []
+            if results.pose_landmarks and results.pose_world_landmarks:
+                landmarks_2d = results.pose_landmarks[0]
+                world_landmarks = results.pose_world_landmarks[0]
 
-                # Process both arms independently.
-                for name, s_idx, e_idx, w_idx, h_idx in ARMS:
-                    if not all(
-                        visible(landmarks[i])
-                        for i in (s_idx, e_idx, w_idx)
-                    ):
+                # Auto-detect body viewpoint
+                viewpoint, _ = bio.detect_viewpoint(world_landmarks)
+
+                arm_data = []
+                for side, s_idx, e_idx, w_idx, h_idx in ARMS:
+                    if not (bio.is_landmark_valid(world_landmarks, s_idx) and
+                            bio.is_landmark_valid(world_landmarks, e_idx) and
+                            bio.is_landmark_valid(world_landmarks, w_idx)):
                         continue
 
-                    shoulder = point(landmarks, s_idx, width, height)
-                    elbow = point(landmarks, e_idx, width, height)
-                    wrist = point(landmarks, w_idx, width, height)
+                    # 3D Metric Coordinates in Meters
+                    s_3d = bio.get_landmark_3d(world_landmarks, s_idx)
+                    e_3d = bio.get_landmark_3d(world_landmarks, e_idx)
+                    w_3d = bio.get_landmark_3d(world_landmarks, w_idx)
+                    h_3d = bio.get_landmark_3d(world_landmarks, h_idx)
 
-                    angle = calculate_angle(shoulder, elbow, wrist)
-                    upper_len = max(15, math.hypot(elbow[0] - shoulder[0], elbow[1] - shoulder[1]))
+                    # 2D Screen Pixels for drawing overlay
+                    s_2d = point_2d(landmarks_2d, s_idx, width, height)
+                    e_2d = point_2d(landmarks_2d, e_idx, width, height)
+                    w_2d = point_2d(landmarks_2d, w_idx, width, height)
 
-                    # Error 1: Closing biceps too much (loss of tension, wrist touching shoulder)
-                    # Normal peak squeeze is ~45-60 deg. Less than 38 deg is over-curled.
-                    is_over_curled = (angle < 38)
+                    # Camera-invariant 3D elbow flexion angle
+                    raw_angle = bio.calculate_angle_3d(s_3d, e_3d, w_3d)
+                    angle_3d = smoother.smooth(f"{side}_angle", raw_angle)
 
-                    # Error 2: Elbow flaring out or swinging horizontally (normalized to upper arm length)
-                    horizontal_drift = abs(elbow[0] - shoulder[0]) / upper_len
-                    is_flaring = (horizontal_drift > 0.35)
+                    # 3D Upper-Arm Drift relative to torso
+                    upper_arm_drift_raw = bio.calculate_angle_3d(e_3d, s_3d, h_3d)
+                    arm_drift_3d = smoother.smooth(f"{side}_drift", upper_arm_drift_raw)
 
-                    # Error 3: Lifting elbows forward/upward (cheating the curl with shoulders)
-                    vertical_drop = (elbow[1] - shoulder[1]) / upper_len
-                    is_lifted = (vertical_drop < 0.60)
+                    # 3D Lateral Flare (horizontal distance from shoulder line)
+                    lateral_flare_dist = abs(e_3d[0] - s_3d[0])
 
-                    # Determine specific issue
+                    # Form Error Checks
                     issue = None
-                    if is_over_curled:
-                        issue = "TOO CLOSE"
-                    elif is_lifted:
-                        issue = "ELBOW LIFTED"
-                    elif is_flaring:
+                    if angle_3d < 36:
+                        issue = "OVER-CURLED"
+                    elif arm_drift_3d > 35:
+                        issue = "ELBOW SWING"
+                    elif lateral_flare_dist > 0.22:
                         issue = "ELBOW FLARE"
 
-                    good = (issue is None)
-
-                    arm_results.append({
-                        "name": name,
-                        "shoulder": shoulder,
-                        "elbow": elbow,
-                        "wrist": wrist,
-                        "angle": angle,
-                        "good": good,
+                    arm_data.append({
+                        "side": side,
+                        "s_2d": s_2d, "e_2d": e_2d, "w_2d": w_2d,
+                        "angle_3d": angle_3d,
+                        "good": (issue is None),
                         "issue": issue
                     })
 
-                # Guides are drawn first, actual arms on top.
-                for arm in arm_results:
-                    draw_arm_guide(
-                        frame, arm["shoulder"], arm["elbow"], arm["wrist"], arm["name"]
-                    )
+                # Draw Target Guides first
+                for arm in arm_data:
+                    draw_arm_guide(frame, arm["s_2d"], arm["e_2d"], arm["w_2d"], arm["side"])
 
-                for arm in arm_results:
+                # Draw Bones & Joint Angles
+                for i, arm in enumerate(arm_data):
                     color = GREEN if arm["good"] else RED
-                    draw_arm(frame, arm["shoulder"], arm["elbow"], arm["wrist"], color)
+                    draw_bone(frame, arm["s_2d"], arm["e_2d"], color, 4)
+                    draw_bone(frame, arm["e_2d"], arm["w_2d"], color, 4)
 
-                    label_y = 65 if arm["name"] == "LEFT" else 95
-                    if arm["good"]:
-                        status_str = f"{arm['name']}: GOOD ({int(arm['angle'])} deg)"
-                    else:
-                        status_str = f"{arm['name']}: ADJUST - {arm['issue']} ({int(arm['angle'])} deg)"
+                    label_y = 75 + i * 26
+                    status_str = f"{arm['side']}: {'GOOD' if arm['good'] else arm['issue']} ({int(arm['angle_3d'])} deg)"
+                    cv2.putText(frame, status_str, (16, label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.48, color, 2)
 
-                    cv2.putText(
-                        frame,
-                        status_str,
-                        (12, label_y),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.48, color, 2
-                    )
+                if arm_data:
+                    avg_angle = sum(a["angle_3d"] for a in arm_data) / len(arm_data)
+                    any_over_curled = any(a["issue"] == "OVER-CURLED" for a in arm_data)
+                    any_swing = any(a["issue"] == "ELBOW SWING" for a in arm_data)
+                    any_flare = any(a["issue"] == "ELBOW FLARE" for a in arm_data)
 
-                if arm_results:
-                    avg_angle = sum(a["angle"] for a in arm_results) / len(arm_results)
-                    all_good = all(a["good"] for a in arm_results)
+                    if any_over_curled:
+                        detected_issue = "OVER-CURLED"
+                    elif any_swing:
+                        detected_issue = "ELBOW SWING"
+                    elif any_flare:
+                        detected_issue = "ELBOW FLARE"
 
-                    # Identify priority feedback message
-                    over_curled_any = any(a["issue"] == "TOO CLOSE" for a in arm_results)
-                    lifted_any = any(a["issue"] == "ELBOW LIFTED" for a in arm_results)
-                    flare_any = any(a["issue"] == "ELBOW FLARE" for a in arm_results)
+                    # Update Repetition Counter
+                    rep_stats = rep_counter.update(avg_angle, has_form_issue=(detected_issue is not None), now_time=now)
 
-                    if over_curled_any:
-                        feedback_msg = "Over-curled! Don't bring hands all the way to shoulders; maintain tension"
+                    # Debounced Feedback Message
+                    active_issue = debouncer.update(detected_issue, now_time=now)
+                    if active_issue == "OVER-CURLED":
+                        feedback_msg = "Over-curled! Maintain tension; don't rest wrists against shoulders"
                         feedback_color = RED
-                    elif lifted_any:
-                        feedback_msg = "Keep elbows pinned at sides; don't lift elbows forward"
+                    elif active_issue == "ELBOW SWING":
+                        feedback_msg = "Pin elbows at your sides; stop swinging elbows forward"
                         feedback_color = RED
-                    elif flare_any:
-                        feedback_msg = "Keep elbows tucked in at your sides; stop flaring out"
+                    elif active_issue == "ELBOW FLARE":
+                        feedback_msg = "Tuck elbows in; stop flaring outward"
                         feedback_color = RED
                     elif avg_angle <= 55:
-                        feedback_msg = "Peak contraction! Lower slowly with control"
+                        feedback_msg = "Peak contraction! Squeeze and lower with control"
                         feedback_color = GREEN
-                    elif avg_angle >= 145:
-                        feedback_msg = "Full extension! Curl upward"
+                    elif avg_angle >= 142:
+                        feedback_msg = "Full extension! Smoothly initiate next curl"
                         feedback_color = GREEN
                     else:
-                        feedback_msg = "Good form! Keep smooth, controlled tempo"
+                        feedback_msg = "Good form! Keep a steady, controlled tempo"
                         feedback_color = GREEN
                 else:
-                    feedback_msg = "Show your arms clearly"
-                    feedback_color = RED
+                    rep_stats = {"total_reps": rep_counter.total_reps, "good_reps": rep_counter.good_reps, "stage": "READY"}
+                    feedback_msg = "Position both arms clearly inside camera view"
+                    feedback_color = YELLOW
 
             else:
+                rep_stats = {"total_reps": rep_counter.total_reps, "good_reps": rep_counter.good_reps, "stage": "READY"}
                 feedback_msg = "PERSON NOT DETECTED"
                 feedback_color = RED
 
-            # HUD
-            draw_top_bar(frame, "BICEP CURLS")
-            draw_feedback_banner(frame, feedback_msg, feedback_color)
-            draw_legend(frame)
+            # Render Modern HUD
+            draw_header_hud(frame, "BICEP CURLS (3D)", viewpoint, rep_stats, fps)
+            draw_bottom_hud(frame, feedback_msg, feedback_color, stage_text=rep_stats["stage"])
 
             cv2.imshow(WINDOW_NAME, frame)
             key = cv2.waitKey(1) & 0xFF
-
             if key == ord("q"):
                 return "quit"
-
             if key == ord("m"):
                 return "menu"
 
     finally:
         camera.release()
         cv2.destroyAllWindows()
-        detector.detector.close()
+        detector.close()
 
 
-# =========================
-# 2. SQUATS
-# =========================
+# ==============================================================================
+# 2. SQUATS (3D Camera-Invariant Depth & Valgus Engine)
+# ==============================================================================
 
 def run_squats():
     detector = PoseDetector()
     camera = get_camera(CAMERA_INDEX)
-
     if not camera.isOpened():
-        print("Cannot open webcam. Check CAMERA_INDEX.")
-        detector.detector.close()
+        print("Cannot open webcam.")
+        detector.close()
         return "menu"
 
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(WINDOW_NAME, 960, 600)
+    cv2.resizeWindow(WINDOW_NAME, 1080, 640)
+
+    smoother = bio.EMASmoother(alpha=0.35)
+    debouncer = bio.FeedbackDebouncer(required_frames=4, min_hold_seconds=1.2)
+    rep_counter = bio.RepetitionCounter("SQUATS")
+
+    prev_time = time.time()
 
     try:
         while True:
             success, frame = camera.read()
-
             if not success:
                 continue
 
-            frame = cv2.flip(frame, 1)
-            frame = cv2.resize(
-                frame,
-                (FRAME_WIDTH, FRAME_HEIGHT),
-                interpolation=cv2.INTER_AREA
-            )
+            now = time.time()
+            fps = 1.0 / max(1e-4, now - prev_time)
+            prev_time = now
 
+            frame = cv2.flip(frame, 1)
+            frame = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT), interpolation=cv2.INTER_AREA)
             height, width = frame.shape[:2]
+
             results = detector.detect_pose(frame)
 
-            feedback_msg = "Stand in frame with legs visible"
+            detected_issue = None
+            feedback_msg = "Stand in frame with full legs visible"
             feedback_color = WHITE
+            viewpoint = "FRONTAL"
 
-            if results.pose_landmarks:
-                landmarks = results.pose_landmarks[0]
-                leg_results = []
+            if results.pose_landmarks and results.pose_world_landmarks:
+                landmarks_2d = results.pose_landmarks[0]
+                world_landmarks = results.pose_world_landmarks[0]
 
-                # Process legs
-                for name, h_idx, k_idx, a_idx, s_idx in LEGS:
-                    if not all(
-                        visible(landmarks[i])
-                        for i in (h_idx, k_idx, a_idx)
-                    ):
+                # Auto-detect body viewpoint (Frontal / Side / Oblique)
+                viewpoint, _ = bio.detect_viewpoint(world_landmarks)
+
+                legs_data = []
+                for side, h_idx, k_idx, a_idx, s_idx in LEGS:
+                    if not (bio.is_landmark_valid(world_landmarks, h_idx) and
+                            bio.is_landmark_valid(world_landmarks, k_idx) and
+                            bio.is_landmark_valid(world_landmarks, a_idx)):
                         continue
 
-                    hip = point(landmarks, h_idx, width, height)
-                    knee = point(landmarks, k_idx, width, height)
-                    ankle = point(landmarks, a_idx, width, height)
+                    # 3D Metric Coordinates in Meters
+                    h_3d = bio.get_landmark_3d(world_landmarks, h_idx)
+                    k_3d = bio.get_landmark_3d(world_landmarks, k_idx)
+                    a_3d = bio.get_landmark_3d(world_landmarks, a_idx)
 
-                    knee_angle = calculate_angle(hip, knee, ankle)
+                    # 2D Screen Pixels
+                    h_2d = point_2d(landmarks_2d, h_idx, width, height)
+                    k_2d = point_2d(landmarks_2d, k_idx, width, height)
+                    a_2d = point_2d(landmarks_2d, a_idx, width, height)
 
-                    shoulder = None
-                    back_angle = None
-                    if visible(landmarks[s_idx]):
-                        shoulder = point(landmarks, s_idx, width, height)
-                        back_angle = calculate_angle(shoulder, hip, knee)
+                    # True 3D Knee Angle (flexion)
+                    raw_knee_angle = bio.calculate_angle_3d(h_3d, k_3d, a_3d)
+                    knee_angle_3d = smoother.smooth(f"{side}_knee", raw_knee_angle)
 
-                    leg_results.append({
-                        "name": name,
-                        "hip": hip,
-                        "knee": knee,
-                        "ankle": ankle,
-                        "shoulder": shoulder,
-                        "knee_angle": knee_angle,
-                        "back_angle": back_angle
+                    # 3D Thigh Angle to Horizontal
+                    femur_angle = bio.calculate_femur_angle_to_horizontal_3d(h_3d, k_3d)
+
+                    # 3D Torso / Back Angle from Vertical (0 deg = straight upright)
+                    back_lean_3d = None
+                    s_2d = None
+                    if bio.is_landmark_valid(world_landmarks, s_idx):
+                        s_3d = bio.get_landmark_3d(world_landmarks, s_idx)
+                        s_2d = point_2d(landmarks_2d, s_idx, width, height)
+                        raw_back = bio.calculate_inclination_from_vertical_3d(h_3d, s_3d)
+                        back_lean_3d = smoother.smooth(f"{side}_back", raw_back)
+
+                    legs_data.append({
+                        "side": side,
+                        "h_2d": h_2d, "k_2d": k_2d, "a_2d": a_2d, "s_2d": s_2d,
+                        "h_3d": h_3d, "k_3d": k_3d, "a_3d": a_3d,
+                        "knee_angle_3d": knee_angle_3d,
+                        "femur_angle": femur_angle,
+                        "back_lean_3d": back_lean_3d,
+                        "good": True,
+                        "issue": None
                     })
 
-                # Draw guides first
-                for leg in leg_results:
-                    draw_squat_guide(
-                        frame, leg["hip"], leg["knee"], leg["ankle"], leg["name"]
-                    )
+                # Check Knee Cave (Valgus) in Frontal / Oblique views
+                knee_cave = False
+                left_leg = next((l for l in legs_data if l["side"] == "LEFT"), None)
+                right_leg = next((l for l in legs_data if l["side"] == "RIGHT"), None)
+                if left_leg and right_leg and ("FRONTAL" in viewpoint or "OBLIQUE" in viewpoint):
+                    knee_dist_3d = np.linalg.norm(left_leg["k_3d"] - right_leg["k_3d"])
+                    ankle_dist_3d = np.linalg.norm(left_leg["a_3d"] - right_leg["a_3d"])
+                    avg_knee_angle = (left_leg["knee_angle_3d"] + right_leg["knee_angle_3d"]) / 2.0
+                    # If knees bend into squat and collapse inward significantly relative to ankles
+                    if avg_knee_angle < 135 and ankle_dist_3d > 0.25:
+                        if knee_dist_3d < (ankle_dist_3d * 0.72):
+                            knee_cave = True
 
-                if leg_results:
-                    # Posture checks
-                    # 1. Back angle check (avoid excessive forward bending / hunched chest)
-                    back_angles = [l["back_angle"] for l in leg_results if l["back_angle"] is not None]
-                    back_too_bent = any(ba < 65 for ba in back_angles)
+                # Draw Guides first
+                for leg in legs_data:
+                    draw_squat_guide(frame, leg["h_2d"], leg["k_2d"], leg["a_2d"], leg["side"])
 
-                    # 2. Knee Cave / Valgus check (if facing camera with both legs visible)
-                    left_leg = next((l for l in leg_results if l["name"] == "LEFT"), None)
-                    right_leg = next((l for l in leg_results if l["name"] == "RIGHT"), None)
-                    knee_cave = False
-                    if left_leg and right_leg:
-                        hip_dist = abs(left_leg["hip"][0] - right_leg["hip"][0])
-                        knee_dist = abs(left_leg["knee"][0] - right_leg["knee"][0])
-                        ankle_dist = abs(left_leg["ankle"][0] - right_leg["ankle"][0])
-                        # If frontal view and knees are noticeably closer together than ankles
-                        avg_knee_angle = (left_leg["knee_angle"] + right_leg["knee_angle"]) / 2
-                        if hip_dist > 30 and avg_knee_angle < 135:
-                            if ankle_dist > 40 and knee_dist < (ankle_dist * 0.72):
-                                knee_cave = True
-
-                    # 3. Squat depth check
-                    avg_knee_angle = sum(l["knee_angle"] for l in leg_results) / len(leg_results)
-                    too_deep = any(l["knee_angle"] < 68 for l in leg_results)
-
-                    # Draw legs and status
-                    for i, leg in enumerate(leg_results):
-                        leg_issue = None
-                        if leg["knee_angle"] < 68:
-                            leg_issue = "TOO DEEP"
-                        elif leg["back_angle"] is not None and leg["back_angle"] < 65:
-                            leg_issue = "CHEST DOWN"
-                        elif knee_cave:
-                            leg_issue = "KNEE CAVE"
-
-                        leg_good = (leg_issue is None)
-                        color = GREEN if leg_good else RED
-                        draw_leg(frame, leg["hip"], leg["knee"], leg["ankle"], color)
-
-                        if leg["shoulder"]:
-                            draw_torso(frame, leg["shoulder"], leg["hip"], color)
-
-                        label_y = 65 + i * 28
-                        if leg_good:
-                            status_str = f"{leg['name']}: GOOD (Knee: {int(leg['knee_angle'])} deg)"
-                        else:
-                            status_str = f"{leg['name']}: ADJUST - {leg_issue} (Knee: {int(leg['knee_angle'])} deg)"
-
-                        cv2.putText(
-                            frame,
-                            status_str,
-                            (12, label_y),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.48, color, 2
-                        )
-
-                    # Form feedback cues
-                    if back_too_bent:
-                        feedback_msg = "Keep chest up and back straight!"
-                        feedback_color = RED
+                # Posture Evaluation for each leg
+                for i, leg in enumerate(legs_data):
+                    issue = None
+                    if leg["knee_angle_3d"] < 68:
+                        issue = "TOO DEEP"
+                    elif leg["back_lean_3d"] is not None and leg["back_lean_3d"] > 48:
+                        issue = "CHEST DOWN"
                     elif knee_cave:
-                        feedback_msg = "Push knees outward - don't let knees cave in!"
+                        issue = "KNEE CAVE"
+
+                    leg["good"] = (issue is None)
+                    leg["issue"] = issue
+
+                    color = GREEN if leg["good"] else RED
+                    draw_bone(frame, leg["h_2d"], leg["k_2d"], color, 4)
+                    draw_bone(frame, leg["k_2d"], leg["a_2d"], color, 4)
+                    if leg["s_2d"]:
+                        draw_bone(frame, leg["s_2d"], leg["h_2d"], color, 3)
+
+                    label_y = 75 + i * 26
+                    status_str = f"{leg['side']}: {'GOOD' if leg['good'] else leg['issue']} ({int(leg['knee_angle_3d'])} deg)"
+                    cv2.putText(frame, status_str, (16, label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.48, color, 2)
+
+                if legs_data:
+                    # If viewed from the side, prioritize the facing leg
+                    if viewpoint == "SIDE_LEFT":
+                        primary_leg = next((l for l in legs_data if l["side"] == "LEFT"), legs_data[0])
+                    elif viewpoint == "SIDE_RIGHT":
+                        primary_leg = next((l for l in legs_data if l["side"] == "RIGHT"), legs_data[0])
+                    else:
+                        primary_leg = legs_data[0]
+
+                    avg_knee_angle = sum(l["knee_angle_3d"] for l in legs_data) / len(legs_data)
+                    any_too_deep = any(l["issue"] == "TOO DEEP" for l in legs_data)
+                    any_chest_down = any(l["issue"] == "CHEST DOWN" for l in legs_data)
+
+                    if any_chest_down:
+                        detected_issue = "CHEST DOWN"
+                    elif knee_cave:
+                        detected_issue = "KNEE CAVE"
+                    elif any_too_deep:
+                        detected_issue = "TOO DEEP"
+
+                    # Rep counter update
+                    rep_stats = rep_counter.update(primary_leg["knee_angle_3d"], has_form_issue=(detected_issue is not None), now_time=now)
+
+                    # Debounced Feedback
+                    active_issue = debouncer.update(detected_issue, now_time=now)
+                    if active_issue == "CHEST DOWN":
+                        feedback_msg = "Keep chest up and spine neutral! Don't bend forward"
                         feedback_color = RED
-                    elif too_deep:
-                        feedback_msg = "Squatting too deep! Stop around parallel (90 deg)"
+                    elif active_issue == "KNEE CAVE":
+                        feedback_msg = "Push knees outward in line with toes! Avoid knee collapse"
                         feedback_color = RED
-                    elif avg_knee_angle <= 100:
-                        feedback_msg = "Great squat depth! Push through heels to stand up"
+                    elif active_issue == "TOO DEEP":
+                        feedback_msg = "Squatting too deep! Stop at parallel (~90 deg) to protect knees"
+                        feedback_color = RED
+                    elif primary_leg["knee_angle_3d"] <= 100:
+                        feedback_msg = "Excellent squat depth! Drive through midfoot to stand up"
                         feedback_color = GREEN
-                    elif avg_knee_angle <= 140:
-                        feedback_msg = "Squat lower to reach parallel (90 deg)"
+                    elif primary_leg["knee_angle_3d"] <= 138:
+                        feedback_msg = "Squat lower until thighs are parallel to ground"
                         feedback_color = YELLOW
                     else:
-                        feedback_msg = "Standing tall. Initiate squat by pushing hips back"
+                        feedback_msg = "Standing tall. Break at hips and knees simultaneously"
                         feedback_color = GREEN
                 else:
-                    feedback_msg = "Stand further back so legs are clearly visible"
-                    feedback_color = RED
+                    rep_stats = {"total_reps": rep_counter.total_reps, "good_reps": rep_counter.good_reps, "stage": "READY"}
+                    feedback_msg = "Step back so hips, knees, and ankles are clearly visible"
+                    feedback_color = YELLOW
 
             else:
+                rep_stats = {"total_reps": rep_counter.total_reps, "good_reps": rep_counter.good_reps, "stage": "READY"}
                 feedback_msg = "PERSON NOT DETECTED"
                 feedback_color = RED
 
-            # HUD
-            draw_top_bar(frame, "SQUATS")
-            draw_feedback_banner(frame, feedback_msg, feedback_color)
-            draw_legend(frame)
+            # Render Modern HUD
+            draw_header_hud(frame, "SQUATS (3D)", viewpoint, rep_stats, fps)
+            draw_bottom_hud(frame, feedback_msg, feedback_color, stage_text=rep_stats["stage"])
 
             cv2.imshow(WINDOW_NAME, frame)
             key = cv2.waitKey(1) & 0xFF
-
             if key == ord("q"):
                 return "quit"
-
             if key == ord("m"):
                 return "menu"
 
     finally:
         camera.release()
         cv2.destroyAllWindows()
-        detector.detector.close()
+        detector.close()
 
 
-# =========================
-# 3. TRICEP EXTENSIONS
-# =========================
+# ==============================================================================
+# 3. TRICEP EXTENSIONS (Dedicated Virtual Coach Engine)
+# ==============================================================================
 
 def run_tricep_extensions():
-    detector = PoseDetector()
-    camera = get_camera(CAMERA_INDEX)
-
-    if not camera.isOpened():
-        print("Cannot open webcam. Check CAMERA_INDEX.")
-        detector.detector.close()
-        return "menu"
-
-    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(WINDOW_NAME, 960, 600)
-
-    try:
-        while True:
-            success, frame = camera.read()
-
-            if not success:
-                continue
-
-            frame = cv2.flip(frame, 1)
-            frame = cv2.resize(
-                frame,
-                (FRAME_WIDTH, FRAME_HEIGHT),
-                interpolation=cv2.INTER_AREA
-            )
-
-            height, width = frame.shape[:2]
-            results = detector.detect_pose(frame)
-
-            feedback_msg = "Raise arms overhead for tricep extension"
-            feedback_color = WHITE
-
-            if results.pose_landmarks:
-                landmarks = results.pose_landmarks[0]
-                arm_results = []
-
-                # Process arms
-                for name, s_idx, e_idx, w_idx, h_idx in ARMS:
-                    if not all(
-                        visible(landmarks[i])
-                        for i in (s_idx, e_idx, w_idx)
-                    ):
-                        continue
-
-                    shoulder = point(landmarks, s_idx, width, height)
-                    elbow = point(landmarks, e_idx, width, height)
-                    wrist = point(landmarks, w_idx, width, height)
-
-                    elbow_angle = calculate_angle(shoulder, elbow, wrist)
-                    upper_len = max(15, math.hypot(elbow[0] - shoulder[0], elbow[1] - shoulder[1]))
-
-                    # Error 1: Closing triceps too much (hyperflexion of the elbow joint)
-                    # Healthy stretch is ~65-85 deg. Angle < 58 deg strains the elbow joint and triceps tendon.
-                    is_over_closed = (elbow_angle < 58)
-
-                    # Error 2: Elbow dropping below overhead position
-                    # In overhead extension, elbow must stay high above the shoulder:
-                    # (shoulder[1] - elbow[1]) / upper_len should be >= 0.40
-                    is_elbow_dropped = ((shoulder[1] - elbow[1]) / upper_len < 0.40)
-
-                    # Error 3: Elbow flaring outward away from shoulder line
-                    horizontal_drift = abs(elbow[0] - shoulder[0]) / upper_len
-                    is_flaring = (horizontal_drift > 0.35)
-
-                    # Determine specific issue
-                    issue = None
-                    if is_over_closed:
-                        issue = "TOO CLOSE"
-                    elif is_elbow_dropped:
-                        issue = "ELBOWS LOW"
-                    elif is_flaring:
-                        issue = "ELBOW FLARE"
-
-                    good = (issue is None)
-
-                    arm_results.append({
-                        "name": name,
-                        "shoulder": shoulder,
-                        "elbow": elbow,
-                        "wrist": wrist,
-                        "angle": elbow_angle,
-                        "good": good,
-                        "issue": issue
-                    })
-
-                # Guides drawn first
-                for arm in arm_results:
-                    draw_tricep_guide(
-                        frame, arm["shoulder"], arm["elbow"], arm["wrist"], arm["name"]
-                    )
-
-                if arm_results:
-                    for i, arm in enumerate(arm_results):
-                        color = GREEN if arm["good"] else RED
-                        draw_arm(frame, arm["shoulder"], arm["elbow"], arm["wrist"], color)
-
-                        label_y = 65 + i * 28
-                        if arm["good"]:
-                            status_str = f"{arm['name']}: GOOD ({int(arm['angle'])} deg)"
-                        else:
-                            status_str = f"{arm['name']}: ADJUST - {arm['issue']} ({int(arm['angle'])} deg)"
-
-                        cv2.putText(
-                            frame,
-                            status_str,
-                            (12, label_y),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.48, color, 2
-                        )
-
-                    avg_angle = sum(a["angle"] for a in arm_results) / len(arm_results)
-                    all_good = all(a["good"] for a in arm_results)
-
-                    # Posture feedback cues
-                    over_closed_any = any(a["issue"] == "TOO CLOSE" for a in arm_results)
-                    dropped_any = any(a["issue"] == "ELBOWS LOW" for a in arm_results)
-                    flare_any = any(a["issue"] == "ELBOW FLARE" for a in arm_results)
-
-                    if over_closed_any:
-                        feedback_msg = "Arms closed too much! Stop at ~70 deg; don't over-flex (protect elbow joints)"
-                        feedback_color = RED
-                    elif dropped_any:
-                        feedback_msg = "Raise elbows up overhead! Keep upper arms pointing straight up"
-                        feedback_color = RED
-                    elif flare_any:
-                        feedback_msg = "Keep elbows tucked close to head - stop flaring outward"
-                        feedback_color = RED
-                    elif avg_angle <= 85:
-                        feedback_msg = "Deep stretch achieved! Now extend overhead"
-                        feedback_color = GREEN
-                    elif avg_angle >= 145:
-                        feedback_msg = "Full extension! Lower forearm smoothly behind head"
-                        feedback_color = GREEN
-                    else:
-                        feedback_msg = "Good elbow control! Keep upper arms stationary"
-                        feedback_color = GREEN
-
-                else:
-                    feedback_msg = "Raise your arms overhead so they are clearly visible"
-                    feedback_color = RED
-
-            else:
-                feedback_msg = "PERSON NOT DETECTED"
-                feedback_color = RED
-
-            # HUD
-            draw_top_bar(frame, "TRICEP EXTENSIONS")
-            draw_feedback_banner(frame, feedback_msg, feedback_color)
-            draw_legend(frame)
-
-            cv2.imshow(WINDOW_NAME, frame)
-            key = cv2.waitKey(1) & 0xFF
-
-            if key == ord("q"):
-                return "quit"
-
-            if key == ord("m"):
-                return "menu"
-
-    finally:
-        camera.release()
-        cv2.destroyAllWindows()
-        detector.detector.close()
+    return tricep_trainer.run_tricep_trainer(CAMERA_INDEX)
 
 
-# =========================
-# MAIN
-# =========================
+
+# ==============================================================================
+# MAIN APPLICATION LOOP
+# ==============================================================================
 
 def main():
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(WINDOW_NAME, 960, 600)
 
     while True:
         draw_menu()
@@ -888,7 +657,7 @@ def main():
                 break
 
         elif key == ord("4"):
-            print("Push-ups are coming soon.")
+            print("Push-ups are scheduled for the next module release.")
 
         elif key == ord("q"):
             break

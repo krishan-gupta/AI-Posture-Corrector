@@ -1,5 +1,6 @@
 
 import os
+import time
 import cv2
 import mediapipe as mp
 
@@ -10,12 +11,11 @@ from mediapipe.tasks.python import vision
 class PoseDetector:
 
     def __init__(self, model_path=None):
-
         # Path to the AI pose model
         if model_path is None:
             model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pose_landmarker.task")
 
-        # Configure the model
+        # Configure the model with optimal confidence thresholds
         base_options = python.BaseOptions(
             model_asset_path=model_path
         )
@@ -24,27 +24,21 @@ class PoseDetector:
             base_options=base_options,
             running_mode=vision.RunningMode.VIDEO,
             num_poses=1,
-            min_pose_detection_confidence=0.5,
-            min_pose_presence_confidence=0.5,
-            min_tracking_confidence=0.5
+            min_pose_detection_confidence=0.6,
+            min_pose_presence_confidence=0.6,
+            min_tracking_confidence=0.6
         )
 
         # Create pose detector
-        self.detector = vision.PoseLandmarker.create_from_options(
-            options
-        )
+        self.detector = vision.PoseLandmarker.create_from_options(options)
 
-        # Frame timestamp
-        self.timestamp = 0
-
+        # High-precision millisecond timestamp tracker
+        self.start_time = time.perf_counter()
+        self.last_timestamp_ms = 0
 
     def detect_pose(self, frame):
-
         # Convert BGR to RGB
-        rgb_frame = cv2.cvtColor(
-            frame,
-            cv2.COLOR_BGR2RGB
-        )
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
         # Convert OpenCV image to MediaPipe image
         mp_image = mp.Image(
@@ -52,13 +46,20 @@ class PoseDetector:
             data=rgb_frame
         )
 
-        # Increase timestamp
-        self.timestamp += 1
+        # Strictly monotonic millisecond timestamp for MediaPipe tracking & temporal filters
+        now_ms = int((time.perf_counter() - self.start_time) * 1000)
+        if now_ms <= self.last_timestamp_ms:
+            now_ms = self.last_timestamp_ms + 1
+        self.last_timestamp_ms = now_ms
 
         # Detect pose
         results = self.detector.detect_for_video(
             mp_image,
-            self.timestamp
+            self.last_timestamp_ms
         )
 
         return results
+
+    def close(self):
+        if self.detector:
+            self.detector.close()
