@@ -198,14 +198,59 @@ def draw_bottom_hud(frame, feedback_text, feedback_color, stage_text=""):
 
 
 def get_camera(index=CAMERA_INDEX):
-    """Open camera with optimal driver and resolution."""
+    """Open camera with optimal driver, exposure calibration, and resolution."""
     cam = cv2.VideoCapture(index, cv2.CAP_DSHOW)
     if not cam.isOpened():
         cam = cv2.VideoCapture(index)
 
-    cam.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
-    cam.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+    if not cam.isOpened():
+        return cam
+
     cam.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+    try:
+        cam.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+    except Exception:
+        pass
+
+    cam.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cam.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    cam.set(cv2.CAP_PROP_FPS, 30)
+
+    try:
+        cam.set(cv2.CAP_PROP_AUTOFOCUS, 1)
+    except Exception:
+        pass
+
+    try:
+        cam.set(cv2.CAP_PROP_AUTO_WB, 1)
+    except Exception:
+        pass
+
+    try:
+        cam.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75)
+    except Exception:
+        try:
+            cam.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1.0)
+        except Exception:
+            pass
+
+    warmup_ok = False
+    for _ in range(5):
+        ret, frame = cam.read()
+        if ret and frame is not None:
+            warmup_ok = True
+
+    if warmup_ok and frame is not None:
+        mean_b = np.mean(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+        if mean_b < 40:
+            for exp_val in [-4.0, -3.0]:
+                cam.set(cv2.CAP_PROP_EXPOSURE, exp_val)
+                for _ in range(3):
+                    ret, frame = cam.read()
+                if ret and frame is not None and np.mean(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)) >= 50:
+                    break
+
     return cam
 
 
