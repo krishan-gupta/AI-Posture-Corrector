@@ -80,8 +80,12 @@ AI-Posture-Corrector/
 ├── pose_landmarker.task   # MediaPipe pretrained pose landmarker model
 ├── pose_detector.py       # Pose detection & high-precision timestamping module
 ├── biomechanics.py        # 3D vector math, viewpoint auto-detection, EMA & rep counting
-├── main.py                # Main webcam feed, exercise state machines & modern HUD
+├── bicep_trainer.py       # Dedicated Bicep Curl Coach (AR Ghost, Peak & Extension ROM)
+├── squat_trainer.py       # Dedicated Squat Coach (AR Parallel Thigh Ghost, Hip Reticle)
+├── tricep_trainer.py      # Dedicated Tricep Coach (AR Lockout & Stretch Ghost)
+├── main.py                # Main interactive menu & unified exercise launcher
 ├── requirements.txt       # Project dependencies
 └── README.md              # Project documentation
 ```
+
 
