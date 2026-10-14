@@ -280,6 +280,77 @@ def draw_checklist_item(panel, x, y, title, is_good, custom_text=None):
                 cv2.FONT_HERSHEY_SIMPLEX, 0.42, badge_color, 1)
 
 
+def init_bicep_camera(camera_index=0, preferred_w=1280, preferred_h=720):
+    """
+    Open webcam with optimal backend, low latency buffering,
+    automatic exposure calibration, and clarity adjustments.
+    """
+    cam = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+    if not cam.isOpened():
+        cam = cv2.VideoCapture(camera_index)
+
+    if not cam.isOpened():
+        return cam
+
+    # Low latency: buffer only 1 frame
+    cam.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+    # Use MJPG compression where available for higher FPS at 720p
+    try:
+        cam.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+    except Exception:
+        pass
+
+    # Request preferred resolution (1280x720) at 30 FPS
+    cam.set(cv2.CAP_PROP_FRAME_WIDTH, preferred_w)
+    cam.set(cv2.CAP_PROP_FRAME_HEIGHT, preferred_h)
+    cam.set(cv2.CAP_PROP_FPS, 30)
+
+    # Enable Autofocus & Auto White Balance if supported
+    try:
+        af = cam.get(cv2.CAP_PROP_AUTOFOCUS)
+        if af != -1.0 and af is not None:
+            cam.set(cv2.CAP_PROP_AUTOFOCUS, 1)
+    except Exception:
+        pass
+
+    try:
+        awb = cam.get(cv2.CAP_PROP_AUTO_WB)
+        if awb != -1.0 and awb is not None:
+            cam.set(cv2.CAP_PROP_AUTO_WB, 1)
+    except Exception:
+        pass
+
+    # Prefer auto-exposure first
+    try:
+        cam.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75)
+    except Exception:
+        try:
+            cam.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1.0)
+        except Exception:
+            pass
+
+    # Allow sensor to converge auto-exposure with warm-up frames
+    warmup_ok = False
+    for _ in range(5):
+        ret, frame = cam.read()
+        if ret and frame is not None:
+            warmup_ok = True
+
+    # If camera remains severely underexposed (dark room or locked shutter), adjust exposure
+    if warmup_ok and frame is not None:
+        mean_b = np.mean(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+        if mean_b < 40:
+            for exp_val in [-4.0, -3.0]:
+                cam.set(cv2.CAP_PROP_EXPOSURE, exp_val)
+                for _ in range(3):
+                    ret, frame = cam.read()
+                if ret and frame is not None and np.mean(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)) >= 50:
+                    break
+
+    return cam
+
+
 def run_bicep_trainer(camera_index=0):
     """
     Main loop for the upgraded 10/10 AI Bicep Curl Virtual Coach.
@@ -287,13 +358,7 @@ def run_bicep_trainer(camera_index=0):
     """
     detector = PoseDetector()
 
-    cam = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
-    if not cam.isOpened():
-        cam = cv2.VideoCapture(camera_index)
-
-    cam.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    cam.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-    cam.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    cam = init_bicep_camera(camera_index, 1280, 720)
 
     if not cam.isOpened():
         print("Cannot open webcam.")
@@ -324,7 +389,20 @@ def run_bicep_trainer(camera_index=0):
             raw_frame = cv2.flip(raw_frame, 1)
 
             feed_w, feed_h = 840, 630
-            video_frame = cv2.resize(raw_frame, (feed_w, feed_h), interpolation=cv2.INTER_AREA)
+            raw_h, raw_w = raw_frame.shape[:2]
+            target_aspect = feed_w / feed_h
+            current_aspect = raw_w / raw_h
+
+            if abs(current_aspect - target_aspect) < 0.01:
+                video_frame = cv2.resize(raw_frame, (feed_w, feed_h), interpolation=cv2.INTER_LINEAR)
+            elif current_aspect > target_aspect:
+                crop_w = int(raw_h * target_aspect)
+                offset = (raw_w - crop_w) // 2
+                video_frame = cv2.resize(raw_frame[:, offset:offset + crop_w], (feed_w, feed_h), interpolation=cv2.INTER_LINEAR)
+            else:
+                crop_h = int(raw_w / target_aspect)
+                offset = (raw_h - crop_h) // 2
+                video_frame = cv2.resize(raw_frame[offset:offset + crop_h, :], (feed_w, feed_h), interpolation=cv2.INTER_LINEAR)
 
             panel_w, panel_h = 400, 630
             panel = np.zeros((panel_h, panel_w, 3), dtype=np.uint8)
